@@ -1,4 +1,5 @@
 import re
+import numpy as np
 
 from modules import scripts, shared
 
@@ -20,12 +21,22 @@ def debug_info(func):
     return debug_info_
 
 
+def find_dict(dict_list, keyword, search_key="name", stop=False):
+    result = next((d for d in dict_list if d[search_key] == keyword), None)
+    if result or not stop:
+        return result
+    else:
+        raise ValueError(f"Dictionary with value '{keyword}' in key '{search_key}' not found.")
+
+
 def flatten_list(lst):
+    result = []
     for element in lst:
         if isinstance(element, list):
-            yield from flatten_list(element)
+            result.extend(flatten_list(element))
         else:
-            yield element
+            result.append(element)
+    return result
 
 
 def is_all_included(target_list, check_list, allow_blank=False, stop=False):
@@ -36,16 +47,250 @@ def is_all_included(target_list, check_list, allow_blank=False, stop=False):
             if not stop:
                 return False
             else:
-                raise ValueError(f"Element '{element}' is not included in check list.")
+                raise ValueError(f"'{element}' is not included in check list.")
     return True
 
 
-def find_dict(dict_list, keyword, search_key="name", stop=False):
-    result = next((d for d in dict_list if d[search_key] == keyword), None)
-    if result or not stop:
-        return result
-    else:
-        raise KeyError(f"Dictionary with value '{keyword}' in key '{search_key}' not found.")
+class ListParser():
+    """This class restores a broken list caused by the following process
+    in the xyz_grid module.
+        -> valslist = [x.strip() for x in chain.from_iterable(
+                                            csv.reader(StringIO(vals)))]
+    It also performs type conversion,
+    adjusts the number of elements in the list, and other operations.
+
+    This class directly modifies the received list.
+    """
+    numeric_pattern = {
+        int: {
+            "range": r"\s*([+-]?\s*\d+)\s*-\s*([+-]?\s*\d+)(?:\s*\(([+-]\d+)\s*\))?\s*",
+            "count": r"\s*([+-]?\s*\d+)\s*-\s*([+-]?\s*\d+)(?:\s*\[(\d+)\s*\])?\s*"
+        },
+        float: {
+            "range": r"\s*([+-]?\s*\d+(?:\.\d*)?)\s*-\s*([+-]?\s*\d+(?:\.\d*)?)(?:\s*\(([+-]\d+(?:\.\d*)?)\s*\))?\s*",
+            "count": r"\s*([+-]?\s*\d+(?:\.\d*)?)\s*-\s*([+-]?\s*\d+(?:\.\d*)?)(?:\s*\[(\d+(?:\.\d*)?)\s*\])?\s*"
+        }
+    }
+
+    ################################################
+    #
+    # Initialization method from here.
+    #
+    ################################################
+
+    def __init__(self, my_list, converter=None, allow_blank=True, exclude_list=None, run=True):
+        self.my_list = my_list
+        self.converter = converter
+        self.allow_blank = allow_blank
+        self.exclude_list = exclude_list
+        self.re_bracket_start = None
+        self.re_bracket_start_precheck = None
+        self.re_bracket_end = None
+        self.re_bracket_end_precheck = None
+        self.re_range = None
+        self.re_count = None
+        self.compile_regex()
+        if run:
+            self.auto_normalize()
+
+    def compile_regex(self):
+        exclude_pattern = "|".join(self.exclude_list) if self.exclude_list else None
+        if exclude_pattern is None:
+            self.re_bracket_start = re.compile(r"^\[")
+            self.re_bracket_end = re.compile(r"\]$")
+        else:
+            self.re_bracket_start = re.compile(fr"^\[(?!(?:{exclude_pattern})\])")
+            self.re_bracket_end = re.compile(fr"(?<!\[(?:{exclude_pattern}))\]$")
+
+        if self.converter not in self.numeric_pattern:
+            return self
+        # If the converter is either int or float.
+        self.re_range = re.compile(self.numeric_pattern[self.converter]["range"])
+        self.re_count = re.compile(self.numeric_pattern[self.converter]["count"])
+        self.re_bracket_start_precheck = None
+        self.re_bracket_end_precheck = self.re_count
+        return self
+
+    ################################################
+    #
+    # Public method from here.
+    #
+    ################################################
+
+    ################################################
+    # This method is executed at the time of initialization.
+    #
+    def auto_normalize(self):
+        if not self.has_list_notation():
+            self.numeric_range_parser()
+            self.type_convert()
+            return self
+        else:
+            self.fix_structure()
+            self.numeric_range_parser()
+            self.type_convert()
+            self.fill_to_longest()
+            return self
+
+    def has_list_notation(self):
+        return any(self._search_bracket(s) for s in self.my_list)
+
+    def numeric_range_parser(self, my_list=None, depth=0):
+        if self.converter not in self.numeric_pattern:
+            return self
+
+        my_list = self.my_list if my_list is None else my_list
+        result = []
+        is_matched = False
+        for s in my_list:
+            if isinstance(s, list):
+                result.extend(self.numeric_range_parser(s, depth+1))
+                continue
+
+            match = self._numeric_range_to_list(s)
+            if s != match:
+                is_matched = True
+                result.extend(match if not depth else [match])
+                continue
+            else:
+                result.append(s)
+                continue
+
+        if depth:
+            return self._transpose(result) if is_matched else [result]
+        else:
+            my_list[:] = result
+            return self
+
+    def type_convert(self, my_list=None):
+        my_list = self.my_list if my_list is None else my_list
+        for i, s in enumerate(my_list):
+            if isinstance(s, list):
+                self.type_convert(s)
+            elif self.allow_blank and (str(s) in ["None", ""]):
+                my_list[i] = None
+            elif self.converter:
+                my_list[i] = self.converter(s)
+            else:
+                my_list[i] = s
+        return self
+
+    def fix_structure(self):
+        def is_same_length(list1, list2):
+            return len(list1) == len(list2)
+
+        start_indices, end_indices = [], []
+        for i, s in enumerate(self.my_list):
+            if is_same_length(start_indices, end_indices):
+                replace_string = self._search_bracket(s, "[", replace="")
+                if s != replace_string:
+                    s = replace_string
+                    start_indices.append(i)
+            if not is_same_length(start_indices, end_indices):
+                replace_string = self._search_bracket(s, "]", replace="")
+                if s != replace_string:
+                    s = replace_string
+                    end_indices.append(i + 1)
+            self.my_list[i] = s
+        if not is_same_length(start_indices, end_indices):
+            raise ValueError(f"Lengths of {start_indices} and {end_indices} are different.")
+        # Restore the structure of a list.
+        for i, j in zip(reversed(start_indices), reversed(end_indices)):
+            self.my_list[i:j] = [self.my_list[i:j]]
+        return self
+
+    def fill_to_longest(self, my_list=None, value=None, index=None):
+        my_list = self.my_list if my_list is None else my_list
+        if not self.sublist_exists(my_list):
+            return self
+        max_length = max(len(sub_list) for sub_list in my_list if isinstance(sub_list, list))
+        for i, sub_list in enumerate(my_list):
+            if isinstance(sub_list, list):
+                fill_value = value if index is None else sub_list[index]
+                my_list[i] = sub_list + [fill_value] * (max_length-len(sub_list))
+        return self
+
+    def sublist_exists(self, my_list=None):
+        my_list = self.my_list if my_list is None else my_list
+        return any(isinstance(item, list) for item in my_list)
+
+    def all_sublists(self, my_list=None):    # Unused method
+        my_list = self.my_list if my_list is None else my_list
+        return all(isinstance(item, list) for item in my_list)
+
+    def get_list(self):                      # Unused method
+        return self.my_list
+
+    ################################################
+    #
+    # Private method from here.
+    #
+    ################################################
+
+    def _search_bracket(self, string, bracket="[", replace=None):
+        if bracket == "[":
+            pattern = self.re_bracket_start
+            precheck = self.re_bracket_start_precheck  # None
+        elif bracket == "]":
+            pattern = self.re_bracket_end
+            precheck = self.re_bracket_end_precheck
+        else:
+            raise ValueError(f"Invalid argument provided. (bracket: {bracket})")
+
+        if precheck and precheck.fullmatch(string):
+            return None if replace is None else string
+        elif replace is None:
+            return pattern.search(string)
+        else:
+            return pattern.sub(replace, string)
+
+    def _numeric_range_to_list(self, string):
+        match = self.re_range.fullmatch(string)
+        if match is not None:
+            if self.converter == int:
+                start = int(match.group(1))
+                end = int(match.group(2)) + 1
+                step = int(match.group(3)) if match.group(3) is not None else 1
+                return list(range(start, end, step))
+            else:              # float
+                start = float(match.group(1))
+                end = float(match.group(2))
+                step = float(match.group(3)) if match.group(3) is not None else 1
+                return np.arange(start, end + step, step).tolist()
+
+        match = self.re_count.fullmatch(string)
+        if match is not None:
+            if self.converter == int:
+                start = int(match.group(1))
+                end = int(match.group(2))
+                num = int(match.group(3)) if match.group(3) is not None else 1
+                return [int(x) for x in np.linspace(start=start, stop=end, num=num).tolist()]
+            else:              # float
+                start = float(match.group(1))
+                end = float(match.group(2))
+                num = int(match.group(3)) if match.group(3) is not None else 1
+                return np.linspace(start=start, stop=end, num=num).tolist()
+        return string
+
+    def _transpose(self, my_list=None):
+        my_list = self.my_list if my_list is None else my_list
+        my_list = [item if isinstance(item, list) else [item] for item in my_list]
+        self.fill_to_longest(my_list, index=-1)
+        return np.array(my_list, dtype=object).T.tolist()
+
+    ################################################
+    #
+    # The methods of ListParser class end here.
+    #
+    ################################################
+
+################################################################
+################################################################
+#
+# Starting the main process of this module.
+#
+################################################################
+################################################################
 
 
 def find_module(module_names):
@@ -56,14 +301,6 @@ def find_module(module_names):
             return data.module
     return None
 
-
-################################################################
-################################################################
-#
-# Starting the main process of this module.
-#
-################################################################
-################################################################
 
 def add_axis_options(xyz_grid):
     # This class is currently meaningless.
@@ -103,73 +340,6 @@ def add_axis_options(xyz_grid):
                 instance_list.append(instance)
             return instance_list
 
-    def normalize_list(valslist, type_func=None, allow_blank=True):
-        """This function restores a broken list caused by the following process
-        in the xyz_grid module.
-            -> valslist = [x.strip() for x in chain.from_iterable(
-                                                csv.reader(StringIO(vals)))]
-        It also performs type conversion,
-        adjusts the number of elements in the list, and other operations.
-        """
-        def search_bracket(string, bracket="[", replace=None):
-            if bracket == "[":
-                pattern = r"^\[(?![a-z0-9]{8}\])"
-            elif bracket == "]":
-                pattern = r"(?<!\[[a-z0-9]{8})\]$"
-            else:
-                raise ValueError(f"Invalid argument provided. (bracket: {bracket})")
-
-            if replace is None:
-                return re.search(pattern, string)
-            else:
-                return re.sub(pattern, replace, string)
-
-        def type_convert(valslist, type_func, allow_blank=True):
-            for i, s in enumerate(valslist):
-                if isinstance(s, list):
-                    type_convert(s, type_func, allow_blank)
-                elif allow_blank and (str(s) in ["None", ""]):
-                    valslist[i] = None
-                elif type_func:
-                    valslist[i] = type_func(s)
-                else:
-                    valslist[i] = s
-
-        def fix_list_structure(valslist):
-            def is_same_length(list1, list2):
-                return len(list1) == len(list2)
-
-            start_indices = []
-            end_indices = []
-            for i, s in enumerate(valslist):
-                if is_same_length(start_indices, end_indices):
-                    if s != (s := search_bracket(s, "[", replace="")):
-                        start_indices.append(i)
-                if not is_same_length(start_indices, end_indices):
-                    if s != (s := search_bracket(s, "]", replace="")):
-                        end_indices.append(i + 1)
-                valslist[i] = s
-            if not is_same_length(start_indices, end_indices):
-                raise ValueError(f"Lengths of {start_indices} and {end_indices} are different.")
-            # Restore the structure of a list.
-            for i, j in zip(reversed(start_indices), reversed(end_indices)):
-                valslist[i:j] = [valslist[i:j]]
-
-        def pad_to_longest(valslist):
-            max_length = max(len(sub_list) for sub_list in valslist if isinstance(sub_list, list))
-            for i, sub_list in enumerate(valslist):
-                if isinstance(sub_list, list):
-                    valslist[i] = sub_list + [None] * (max_length-len(sub_list))
-
-        if not any(search_bracket(s) for s in valslist):    # There is no list inside
-            type_convert(valslist, type_func, allow_blank)  # Type conv
-            return
-        else:                                               # There is a list inside
-            fix_list_structure(valslist)                    # Fix
-            type_convert(valslist, type_func, allow_blank)  # Type conv
-            pad_to_longest(valslist)                        # Fill sublist with None
-            return
-
     ################################################
     ################################################
     #
@@ -189,14 +359,17 @@ def add_axis_options(xyz_grid):
 
         return apply_field_
 
+    ################################################
     # Set this function as the type attribute of the AxisOption class.
     # To skip the following processing of xyz_grid module.
     #   -> valslist = [opt.type(x) for x in valslist]
     # Perform type conversion using the function
     # set to the confirm attribute instead.
+    #
     def identity(x):
         return x
 
+    ################################################
     # The confirm function defined in this module
     # enables list notation and performs type conversion.
     #
@@ -210,17 +383,22 @@ def add_axis_options(xyz_grid):
     #     Enabled Only:
     #         any = [any] = [any, None, None, ...]
     #         (any and [any] are considered equivalent)
+    #
     def confirm(func_or_str):
         @debug_info
         def confirm_(p, xs):
-            if callable(func_or_str):           # func_or_str is type_func
-                normalize_list(xs, func_or_str, allow_blank=True)
+            if callable(func_or_str):           # func_or_str is converter
+                ListParser(xs, func_or_str, allow_blank=True)
                 return
 
             elif isinstance(func_or_str, str):  # func_or_str is keyword
                 valid_data = find_dict(validation_data, func_or_str, stop=True)
-                normalize_list(xs, valid_data["type"], allow_blank=True)
-                is_all_included(xs, valid_data["element"](), allow_blank=True, stop=True)
+                converter = valid_data["type"]
+                exclude_list = valid_data["exclude"]() if valid_data["exclude"] else None
+                check_list = valid_data["check"]()
+
+                ListParser(xs, converter, allow_blank=True, exclude_list=exclude_list)
+                is_all_included(xs, check_list, allow_blank=True, stop=True)
                 return
 
             else:
@@ -252,10 +430,15 @@ def add_axis_options(xyz_grid):
     def choices_preprocessor():
         return list(controlnet.Script().preprocessor)
 
+    def make_excluded_list():
+        pattern = re.compile(r"\[(\w+)\]")
+        return [match.group(1) for s in choices_model()
+                for match in pattern.finditer(s)]
+
     validation_data = [
-        {"name": "model", "type": str, "element": choices_model, "label": "ControlNet Model"},
-        {"name": "resize_mode", "type": str, "element": choices_resize_mode, "label": "Resize Mode"},
-        {"name": "preprocessor", "type": str, "element": choices_preprocessor, "label": "Preprocessor"},
+        {"name": "model", "type": str, "check": choices_model, "exclude": make_excluded_list},
+        {"name": "resize_mode", "type": str, "check": choices_resize_mode, "exclude": None},
+        {"name": "preprocessor", "type": str, "check": choices_preprocessor, "exclude": None},
     ]
 
     extra_axis_options = [
@@ -275,7 +458,8 @@ def add_axis_options(xyz_grid):
 
 
 def run():
-    if xyz_grid := find_module("xyz_grid.py, xy_grid.py"):
+    xyz_grid = find_module("xyz_grid.py, xy_grid.py")
+    if xyz_grid:
         add_axis_options(xyz_grid)
 
 

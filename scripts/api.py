@@ -176,7 +176,7 @@ def nest_deprecated_cn_fields(any2img_request):
 
 def create_alwayson_scripts_dict(any2img_request, is_img2img: bool):
     control_unit_requests = any2img_request.controlnet_units
-    cn_args = [is_img2img, False] # might need to change if these get depricated
+    cn_args = [is_img2img, False] # is_img2img and is_ui, might need to change if these get depricated
     for control_unit_request in control_unit_requests:
         cn_args = cn_args + to_api_arg_list(control_unit_request)
     alwayson_dict = any2img_request.alwayson_scripts

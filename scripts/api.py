@@ -124,13 +124,12 @@ class ApiHijack(api.Api):
 
     def controlnet_any2img(self, any2img_request, original_callback, p_class, script_runner, is_img2img):
         any2img_request = nest_deprecated_cn_fields(any2img_request)
-        script_runner = create_cn_script_runner(script_runner, any2img_request.controlnet_units, is_img2img)
+        create_alwayson_scripts_dict(any2img_request, is_img2img)
         delattr(any2img_request, 'controlnet_units')
         with self.queue_lock:
             self_copy = copy.copy(self)
             self_copy.queue_lock = contextlib.nullcontext()
-            with OverrideInit(p_class, scripts=script_runner):
-                return original_callback(self_copy, any2img_request)
+            return original_callback(self_copy, any2img_request)
 
 api.Api = ApiHijack
 
@@ -175,6 +174,14 @@ def nest_deprecated_cn_fields(any2img_request):
     any2img_request.controlnet_units.insert(0, ControlNetUnitRequest(**deprecated_cn_fields))
     return any2img_request
 
+def create_alwayson_scripts_dict(any2img_request, is_img2img: bool):
+    control_unit_requests = any2img_request.controlnet_units
+    cn_args = [is_img2img, False] # might need to change if these get depricated
+    for control_unit_request in control_unit_requests:
+        cn_args = cn_args + to_api_arg_list(control_unit_request)
+    alwayson_dict = any2img_request.alwayson_scripts
+    alwayson_dict["ControlNet"] = {"args" : cn_args}
+
 def create_cn_script_runner(script_runner: scripts.ScriptRunner, control_unit_requests: List[ControlNetUnitRequest], is_img2img: bool):
     if not script_runner.scripts:
         script_runner.initialize_scripts(False)
@@ -211,6 +218,30 @@ def create_cn_script_runner(script_runner: scripts.ScriptRunner, control_unit_re
         setattr(cn_script_runner, k, make_script_runner_f_hijack(original_f))
 
     return cn_script_runner
+
+def to_api_arg_list(unit_request: ControlNetUnitRequest) -> list:
+    args= [True] # enable
+    args.append(unit_request.module)
+    args.append(unit_request.model)
+    args.append(unit_request.weight)
+    image_dict = {}
+    if unit_request.input_image:
+        image_dict["image"] = unit_request.input_image
+    if unit_request.mask:
+        image_dict["mask"] = unit_request.mask
+    args.append(image_dict)
+    args.append(False) # scribble_mode
+    args.append(unit_request.resize_mode)
+    args.append(False) # rgbbgr_mode
+    args.append(unit_request.lowvram)
+    args.append(unit_request.processor_res)
+    args.append(unit_request.threshold_a)
+    args.append(unit_request.threshold_b)
+    args.append(unit_request.guidance_start)
+    args.append(unit_request.guidance_end)
+    args.append(unit_request.guessmode)
+
+    return args
 
 def to_api_cn_unit(unit_request: ControlNetUnitRequest) -> external_code.ControlNetUnit:
     input_image = to_base64_nparray(unit_request.input_image) if unit_request.input_image else None
